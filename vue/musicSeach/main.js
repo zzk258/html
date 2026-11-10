@@ -48,9 +48,20 @@ function httpJson(url, timeout) {
 	});
 }
 
-/* 酷我搜索 */
+/* 清洗酷我返回的字段：&nbsp; 换空格，
+ * 酷我会把 & 双重转义成 \\\\u0026，这里把“若干反斜杠 + u0026”统一还原成 & */
+function cleanText(s) {
+	return String(s || '')
+		.replace(/&nbsp;/g, ' ')
+		.replace(/\\+u0026/g, '&')
+		.replace(/\s+/g, ' ')
+		.trim();
+}
+
+/* 酷我搜索（必须用 https：页面部署在 GitHub Pages 等 https 站点时，
+ * http 的 JSONP 脚本属于“混合内容”，会被浏览器直接拦截） */
 function searchKuwo(keyword, rn) {
-	var url = 'http://search.kuwo.cn/r.s'
+	var url = 'https://search.kuwo.cn/r.s'
 		+ '?all=' + encodeURIComponent(keyword)
 		+ '&ft=music&itemset=web_2013&client=kt&pn=0&rn=' + (rn || 50)
 		+ '&rformat=json&encoding=utf8';
@@ -60,9 +71,9 @@ function searchKuwo(keyword, rn) {
 		}).map(function (it) {
 			return {
 				rid: it.MUSICRID,
-				name: (it.NAME || it.SONGNAME || '').replace(/&nbsp;/g, ' '),
-				artist: (it.ARTIST || '').replace(/&nbsp;/g, ' '),
-				album: (it.ALBUM || '').replace(/&nbsp;/g, ' '),
+				name: cleanText(it.NAME || it.SONGNAME),
+				artist: cleanText(it.ARTIST),
+				album: cleanText(it.ALBUM),
 				duration: parseInt(it.DURATION || 0, 10),
 				src: ''
 			};
@@ -70,12 +81,19 @@ function searchKuwo(keyword, rn) {
 	});
 }
 
-/* 酷我播放地址 */
+/* 酷我播放地址（同样必须 https，避免 https 页面被混合内容拦截） */
 function getKuwoUrl(rid) {
-	var url = 'http://antiserver.kuwo.cn/anti.s'
+	var url = 'https://antiserver.kuwo.cn/anti.s'
 		+ '?type=convert_url3&rid=' + encodeURIComponent(rid)
 		+ '&format=mp3&response=url';
-	return jsonp(url).then(function (res) { return res.url || ''; });
+	return jsonp(url).then(function (res) {
+		var media = (res && res.url) || '';
+		// 音源地址有时仍是 http，https 页面下播放同样会被拦截，统一升级为 https
+		if (media && location.protocol === 'https:' && media.indexOf('http://') === 0) {
+			media = 'https://' + media.slice(7);
+		}
+		return media;
+	});
 }
 
 /* ---------------- 歌词 ---------------- */
