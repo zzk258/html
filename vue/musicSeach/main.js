@@ -1,6 +1,7 @@
-﻿/* 在线音乐播放器 · 单页版
+/* 在线音乐播放器 · 单页版
  * 数据源：酷我音乐免费接口（搜索 + 播放地址，JSONP）
- *        网易云音乐公开镜像（歌词，CORS axios）
+ *        歌词：酷我 musicId 歌词接口（与音源同源，CORS 开放，失败自动重试）
+ *              回退 1 酷我搜索同名歌曲 → 回退 2 网易云歌词接口
  * 布局：搜索栏 → 推荐歌手 → 播放列表 → 歌词 → 底部固定控制条
  */
 
@@ -23,6 +24,27 @@ function jsonp(url) {
 			reject(new Error('网络请求失败'));
 		};
 		document.body.appendChild(script);
+	});
+}
+
+/* 普通 JSON 请求（只用于明确返回 CORS 头的接口，如 *）
+ * 带超时，避免接口卡住时歌词区一直显示“加载中” */
+function httpJson(url, timeout) {
+	return new Promise(function (resolve, reject) {
+		var xhr = new XMLHttpRequest();
+		xhr.open('GET', url, true);
+		xhr.timeout = timeout || 8000;
+		xhr.onload = function () {
+			if (xhr.status >= 200 && xhr.status < 300) {
+				try { resolve(JSON.parse(xhr.responseText)); }
+				catch (e) { reject(e); }
+			} else {
+				reject(new Error('HTTP ' + xhr.status));
+			}
+		};
+		xhr.onerror = function () { reject(new Error('network')); };
+		xhr.ontimeout = function () { reject(new Error('timeout')); };
+		xhr.send();
 	});
 }
 
@@ -56,60 +78,187 @@ function getKuwoUrl(rid) {
 	return jsonp(url).then(function (res) { return res.url || ''; });
 }
 
-/* 网易云歌词（按歌名+歌手搜索关联） */
-function httpGet(url, params) {
-	/* 原生 XHR + Promise，替代 axios（file:// 下无需外部依赖） */
-	return new Promise(function (resolve, reject) {
-		var full = url + '?' + Object.keys(params).map(function (k) {
-			return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
-		}).join('&');
-		var xhr = new XMLHttpRequest();
-		xhr.open('GET', full, true);
-		xhr.onload = function () {
-			if (xhr.status >= 200 && xhr.status < 300) {
-				try { resolve(JSON.parse(xhr.responseText)); }
-				catch (e) { reject(e); }
-			} else reject(new Error('HTTP ' + xhr.status));
-		};
-		xhr.onerror = function () { reject(new Error('network')); };
-		xhr.send();
-	});
+/* ---------------- 歌词 ---------------- */
+
+/* 文本归一化：去 &nbsp;、压缩空白、转小写 */
+function normText(s) {
+	return String(s || '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-function getLyric(name, artist) {
-	var kw = (name || '').trim() + ' ' + (artist || '').trim().split(/[&、\/]/)[0];
-	var api = 'https://apis.netstart.cn/music';
-	return httpGet(api + '/search', { keywords: kw, limit: 3 })
-		.then(function (data) {
-			var songs = (data && data.result && data.result.songs) || [];
-			if (!songs.length) return Promise.reject('no song');
-			return httpGet(api + '/lyric', { id: songs[0].id });
-		})
-		.then(function (data) {
-			var lrc = (data && data.lrc && data.lrc.lyric) || '';
-			return parseLrc(lrc);
-		});
+/* 取主歌手（去掉合唱、feat 等次要信息） */
+function primaryArtist(artist) {
+	return normText(String(artist || '').split(/[&、\/,，;]|feat\.?/i)[0]);
 }
 
-/* 解析 LRC 文本为带时间的行 */
+/* 明显不是原曲版本的关键词，命中则不采用（避免拿到伴奏 / DJ / 翻唱歌词） */
+var LYRIC_BAD_WORDS = [
+	'dj', '伴奏', '纯音乐', '钢琴版', '女声版', '男声版', 'cover', '翻唱', 'remix',
+	'live', '串烧', 'demo', '现场', '童声', '清唱', '对唱版', 'karaoke', 'instrumental', '钢琴'
+];
+
+function cleanLyricLine(s) {
+	return String(s || '').replace(/\r/g, '').replace(/&nbsp;/g, ' ').trim();
+}
+
+/* 判断候选歌曲是不是我们要的那一首
+ * needArtist=false 时只校验歌名（最后的兜底放宽） */
+function matchSong(name, artist, candName, candArtist, needArtist) {
+	var n = normText(name);
+	var cn = normText(candName);
+	if (!n || !cn) return false;
+	if (cn.indexOf(n) === -1 && n.indexOf(cn) === -1) return false;
+	if (needArtist !== false) {
+		var a = primaryArtist(artist);
+		var ca = normText(candArtist);
+		if (a && ca.indexOf(a) === -1) return false;
+	}
+	for (var i = 0; i < LYRIC_BAD_WORDS.length; i++) {
+		if (cn.indexOf(LYRIC_BAD_WORDS[i]) !== -1) return false;
+	}
+	return true;
+}
+
+/* 解析 LRC 文本为带时间的行（兼容 [mm:ss.ms] / [mm:ss:ms] 两种写法） */
 function parseLrc(text) {
 	if (!text) return [];
-	var lines = text.split('\n');
+	var src = String(text).split(/\r?\n/);
 	var out = [];
-	var re = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
-	for (var i = 0; i < lines.length; i++) {
-		var line = lines[i];
+	var re = /\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]/g;
+	for (var i = 0; i < src.length; i++) {
+		var line = src[i];
 		var m;
 		var times = [];
+		re.lastIndex = 0;
 		while ((m = re.exec(line)) !== null) {
-			times.push(parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + parseInt(m[3] || '0', 10) / 1000);
+			var frac = m[3] || '0';
+			var ms = parseInt(frac, 10) / (frac.length === 3 ? 1000 : (frac.length === 2 ? 100 : 10));
+			times.push(parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + ms);
 		}
-		var text = line.replace(/\[[^\]]*\]/g, '').trim();
-		if (!text || !times.length) continue;
-		for (var t = 0; t < times.length; t++) out.push({ time: times[t], text: text });
+		var lineText = cleanLyricLine(line.replace(/\[[^\]]*\]/g, ''));
+		if (!lineText || !times.length) continue;
+		for (var t = 0; t < times.length; t++) out.push({ time: times[t], text: lineText });
 	}
 	out.sort(function (a, b) { return a.time - b.time; });
 	return out;
+}
+
+/* 酷我 lrclist（[{"lineLyric":"...","time":"12.58"}]）转为统一行结构 */
+function kuwoLrclistToLines(data) {
+	var list = (data && data.data && data.data.lrclist) || [];
+	var out = [];
+	for (var i = 0; i < list.length; i++) {
+		var t = parseFloat(list[i].time);
+		var txt = cleanLyricLine(list[i].lineLyric);
+		if (!isNaN(t) && txt) out.push({ time: t, text: txt });
+	}
+	out.sort(function (a, b) { return a.time - b.time; });
+	return out;
+}
+
+/* 歌词源 A：酷我（musicId 就是当前播放音源的歌曲 id，最准确）
+ * 该接口偶发返回“音乐查询失败”，失败或空结果时重试一次 */
+function kuwoLyricById(musicId) {
+	if (!musicId) return Promise.resolve([]);
+	var url = 'https://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=' + encodeURIComponent(musicId);
+	return new Promise(function (resolve) {
+		var attempt = 0;
+		function go() {
+			attempt++;
+			httpJson(url).then(function (data) {
+				var lines = kuwoLrclistToLines(data);
+				if (lines.length || attempt >= 2) resolve(lines);
+				else setTimeout(go, 400);
+			}, function () {
+				if (attempt >= 2) resolve([]);
+				else setTimeout(go, 400);
+			});
+		}
+		go();
+	});
+}
+
+/* 歌词源 B：网易云（vkeys 中转，JSON + CORS） */
+function neteaseSearch(keyword, num) {
+	var url = 'https://api.vkeys.cn/v2/music/netease?word='
+		+ encodeURIComponent(keyword) + '&num=' + (num || 8);
+	return httpJson(url).then(function (res) {
+		return (res && res.data) || [];
+	}).catch(function () { return []; });
+}
+
+function neteaseLyricById(id) {
+	var url = 'https://api.vkeys.cn/v2/music/netease/lyric?id=' + encodeURIComponent(id);
+	return httpJson(url).then(function (res) {
+		var d = (res && res.data) || {};
+		return parseLrc(d.lrc || '');
+	}).catch(function () { return []; });
+}
+
+/* 依次尝试候选，返回第一份非空歌词 */
+function firstNonEmpty(list, fetchOne, limit) {
+	var max = Math.min(list.length, limit || 5);
+	var i = 0;
+	return new Promise(function (resolve) {
+		function next() {
+			if (i >= max) return resolve([]);
+			var item = list[i++];
+			fetchOne(item).then(function (lines) {
+				if (lines && lines.length) resolve(lines);
+				else next();
+			}, next);
+		}
+		next();
+	});
+}
+
+/* 歌词缓存：同一首歌重复播放不再重复请求 */
+var lyricCache = {};
+
+/* 获取歌词：同源音乐 id → 酷我搜索同名 → 网易云，逐级回退 */
+function getLyric(song) {
+	var key = String(song.rid || '') + '|' + song.name + '|' + song.artist;
+	if (lyricCache[key]) return Promise.resolve(lyricCache[key]);
+
+	var musicId = String(song.rid || '').replace(/^MUSIC_/, '');
+	var keyword = (String(song.name || '') + ' ' + primaryArtist(song.artist)).trim();
+
+	/* 第 1 级：直接用当前歌曲的酷我 id 取歌词 */
+	return kuwoLyricById(musicId).then(function (lines) {
+		if (lines.length) return lines;
+
+		/* 第 2 级：按歌名+歌手在酷我重新搜，用新 id 取歌词（老 rid 可能已下架） */
+		return searchKuwo(keyword, 10).catch(function () { return []; }).then(function (list) {
+			var strict = list.filter(function (it) {
+				return matchSong(song.name, song.artist, it.name, it.artist);
+			});
+			var loose = list.filter(function (it) {
+				return matchSong(song.name, '', it.name, it.artist, false);
+			});
+			var pick = strict.length ? strict : loose;
+			return firstNonEmpty(pick, function (it) {
+				return kuwoLyricById(String(it.rid || '').replace(/^MUSIC_/, ''));
+			}, 5);
+		});
+	}).then(function (lines) {
+		if (lines.length) return lines;
+
+		/* 第 3 级：网易云歌词 */
+		return neteaseSearch(keyword, 8).then(function (list) {
+			var strict = list.filter(function (it) {
+				return matchSong(song.name, song.artist, it.song, it.singer);
+			});
+			var loose = list.filter(function (it) {
+				return matchSong(song.name, '', it.song, it.singer, false);
+			});
+			var pick = strict.length ? strict : loose;
+			return firstNonEmpty(pick, function (it) {
+				return neteaseLyricById(it.id);
+			}, 5);
+		});
+	}).then(function (lines) {
+		if (lines.length) lyricCache[key] = lines;   // 只缓存成功的，失败下次还能重试
+		return lines;
+	});
 }
 
 /* ---------------- 默认推荐榜（真实可播数据，酷我原唱音源） ---------------- */
@@ -188,7 +337,8 @@ window.onload = function () {
 			lyricLines: [],
 			lyricIdx: -1,
 			lyricLoading: false,
-			lyricFocus: false
+			lyricFocus: false,
+			lyricToken: 0        // 防止切歌后旧请求回写歌词
 		},
 
 		computed: {
@@ -326,20 +476,23 @@ window.onload = function () {
 				});
 			},
 
-			/* 加载歌词 */
+			/* 加载歌词（三级回退在 getLyric 内部完成） */
 			loadLyric: function (song) {
 				this.lyricLines = [];
 				this.lyricIdx = -1;
 				this.lyricLoading = true;
 				var self = this;
-				getLyric(song.name, song.artist).then(function (lines) {
+				var token = ++this.lyricToken;
+				getLyric(song).then(function (lines) {
+					// 切歌后旧请求返回，直接丢弃
+					if (token !== self.lyricToken || self.current !== song) return;
 					self.lyricLoading = false;
-					if (self.current !== song) return;
 					self.lyricLines = lines;
 					self.updateLyricIndex();
 				}).catch(function () {
+					if (token !== self.lyricToken || self.current !== song) return;
 					self.lyricLoading = false;
-					if (self.current === song) self.lyricLines = [];
+					self.lyricLines = [];
 				});
 			},
 
@@ -359,6 +512,7 @@ window.onload = function () {
 			},
 
 			scrollLyric: function (idx) {
+				if (this.lyricFocus) return;   // 用户点击歌词区后暂停自动滚动，方便自己翻看
 				var self = this;
 				this.$nextTick(function () {
 					var box = self.$refs.lyricBox;
@@ -375,14 +529,16 @@ window.onload = function () {
 			},
 
 			clearLyric: function () {
+				this.lyricToken++;
 				this.lyricLines = [];
 				this.lyricIdx = -1;
 				this.lyricLoading = false;
 			},
 
-			/* 点击歌词区暂停自动滚动 */
+			/* 点击歌词区暂停/恢复自动滚动 */
 			toggleLyricFocus: function () {
 				this.lyricFocus = !this.lyricFocus;
+				if (!this.lyricFocus) this.scrollLyric(this.lyricIdx);
 			},
 
 			togglePlay: function () {
