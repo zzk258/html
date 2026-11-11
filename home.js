@@ -50,11 +50,12 @@ const DATA = [
 		]
 	},
 	{
-		id: 'vue',
-		name: 'Vue',
-		icon: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3l9-16z"/><path d="M12 10l4.5 8h-9L12 10z"/></svg>',
+		id: 'project',
+		name: '项目开发案例',
+		icon: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="3" y1="12" x2="21" y2="12"/></svg>',
 		items: [
-			{ name: '在线音乐播放器', url: 'vue/musicSeach/index.html', desc: 'Vue + axios 音乐搜索与播放器，响应式适配桌面与移动端' }
+			{ name: '在线音乐播放器', url: 'vue/musicSeach/index.html', desc: '歌曲搜索 + 播放列表，支持搜索歌手/专辑、推荐榜单与响应式适配，桌面与移动端通用' },
+			{ name: '极简阅读器', url: 'vue/极简阅读器/index.html', desc: '本地导入 EPUB 电子书，支持拖拽打开、阅读进度记录、笔记面板与排版主题切换' }
 		]
 	}
 ];
@@ -105,7 +106,7 @@ function renderNav() {
 			</li>`).join('');
 
 		return `
-			<section class="cat${kw || cat.id === 'html' ? ' open' : ''}" data-cat="${cat.id}">
+			<section class="cat${kw || cat.id === 'html' || cat.id === 'project' ? ' open' : ''}" data-cat="${cat.id}">
 				<button type="button" class="cat-head" data-cat="${cat.id}">
 					<span class="cat-icon">${cat.icon}</span>
 					<span>${escapeHtml(cat.name)}</span>
